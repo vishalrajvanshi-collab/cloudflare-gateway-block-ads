@@ -1,0 +1,31 @@
+name: Cleanup old workflow runs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Deleting old workflow runs..."
+
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | [.id, .run_number, .created_at, .status] | @tsv' |
+          tail -n +101 |
+          while IFS=$'\t' read -r id number created status; do
+            echo "Deleting run #$number ($id)"
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/runs/$id" || true
+          done
