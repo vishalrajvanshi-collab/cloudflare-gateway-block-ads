@@ -49,15 +49,15 @@ jobs:
               "/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
               --jq '.workflow_runs[] | [.id, .run_number, .created_at] | @tsv' |
             tail -n +2 |
-            while IFS=$'\t' read -r RUN_ID RUN_NUMBER CREATED_AT; do
-
-              echo "Deleting run #${RUN_NUMBER} (${CREATED_AT})..."
-
+            cut -f1 |
+            xargs -P 10 -n 1 -I {} sh -c '
+              echo "Deleting run {}..."
               gh api \
                 --method DELETE \
-                "/repos/${REPO}/actions/runs/${RUN_ID}" || true
+                "/repos/'"${REPO}"'/actions/runs/{}" || true
+            '
 
-            done
+            echo "Finished cleaning ${WORKFLOW_NAME}."
           }
 
           cleanup_workflow "Block ads update"
