@@ -5,54 +5,65 @@ on:
   schedule:
     - cron: "0 3 * * *"
 
+permissions:
+  actions: write
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
 
-    permissions:
-      actions: write
-
     steps:
-      - name: Delete old Block ads update runs
+      - name: Cleanup old workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
 
-          echo "Finding Block ads update workflow..."
+          REPO="${{ github.repository }}"
 
-          WORKFLOW_ID=$(gh api \
-            "/repos/${{ github.repository }}/actions/workflows" \
-            --paginate \
-            --jq '.workflows[] | select(.name == "Block ads update") | .id' |
-            head -n 1)
+          cleanup_workflow() {
+            WORKFLOW_NAME="$1"
 
-          if [ -z "$WORKFLOW_ID" ]; then
-            echo "Workflow 'Block ads update' not found."
-            echo "Available workflows:"
-            gh api \
-              "/repos/${{ github.repository }}/actions/workflows" \
+            echo ""
+            echo "========================================"
+            echo "Cleaning: ${WORKFLOW_NAME}"
+            echo "========================================"
+
+            WORKFLOW_ID=$(gh api \
+              "/repos/${REPO}/actions/workflows" \
               --paginate \
-              --jq '.workflows[] | "\(.id) - \(.name)"'
-            exit 1
-          fi
+              --jq --arg NAME "$WORKFLOW_NAME" \
+              '.workflows[] | select(.name == $NAME) | .id' |
+              head -n 1)
 
-          echo "Workflow ID: $WORKFLOW_ID"
-          echo "Keeping newest 5 runs."
+            if [ -z "$WORKFLOW_ID" ]; then
+              echo "Workflow not found: ${WORKFLOW_NAME}"
+              return 0
+            fi
 
-          gh api \
-            --paginate \
-            "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
-            --jq '.workflow_runs[] | [.id, .run_number, .created_at] | @tsv' |
-          tail -n +6 |
-          while IFS=$'\t' read -r RUN_ID RUN_NUMBER CREATED_AT; do
-
-            echo "Deleting run #${RUN_NUMBER} (${CREATED_AT})..."
+            echo "Workflow ID: ${WORKFLOW_ID}"
+            echo "Keeping newest 1 run."
 
             gh api \
-              --method DELETE \
-              "/repos/${{ github.repository }}/actions/runs/${RUN_ID}"
+              --paginate \
+              "/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+              --jq '.workflow_runs[] | [.id, .run_number, .created_at] | @tsv' |
+            tail -n +2 |
+            while IFS=$'\t' read -r RUN_ID RUN_NUMBER CREATED_AT; do
 
-          done
+              echo "Deleting run #${RUN_NUMBER} (${CREATED_AT})..."
 
+              gh api \
+                --method DELETE \
+                "/repos/${REPO}/actions/runs/${RUN_ID}" || true
+
+            done
+          }
+
+          cleanup_workflow "Block ads update"
+          cleanup_workflow "Cleanup old block_ads runs"
+
+          echo ""
+          echo "========================================"
           echo "Cleanup complete."
+          echo "========================================"
