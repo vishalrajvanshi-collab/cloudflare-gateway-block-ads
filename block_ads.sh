@@ -1,10 +1,14 @@
 #!/bin/bash
 
-set -euo pipefail
+set -u
 
-# ============================================================
+echo "========================================"
+echo "Block Ads Update"
+echo "========================================"
+
+# --------------------------------------------------
 # Configuration
-# ============================================================
+# --------------------------------------------------
 
 PREFIX="Block ads"
 
@@ -12,16 +16,19 @@ MAX_LIST_SIZE=1000
 MAX_LISTS=100
 MAX_RETRIES=10
 
-DOMAINS_URL="https://small.oisd.nl/domainswild2"
+DOMAIN_FILE="oisd_small_domainswild2.txt"
+CHUNK_PREFIX="oisd_small_domainswild2.txt."
 
-CLOUDFLARE_API="https://api.cloudflare.com/client/v4"
+API_TOKEN="${API_TOKEN:-}"
+ACCOUNT_ID="${ACCOUNT_ID:-}"
 
-DOMAINS_FILE="oisd_small_domainswild2.txt"
+BASE_URL="https://api.cloudflare.com/client/v4"
+LISTS_URL="${BASE_URL}/accounts/${ACCOUNT_ID}/gateway/lists"
+RULES_URL="${BASE_URL}/accounts/${ACCOUNT_ID}/gateway/rules"
 
-
-# ============================================================
+# --------------------------------------------------
 # Error handling
-# ============================================================
+# --------------------------------------------------
 
 error() {
     echo ""
@@ -29,767 +36,631 @@ error() {
     echo "ERROR"
     echo "========================================"
     echo "$1"
-    echo "========================================"
     echo ""
-
-    rm -f "${DOMAINS_FILE}."*
+    rm -f "${CHUNK_PREFIX}"*
     exit 1
 }
 
+# --------------------------------------------------
+# Check required environment variables
+# --------------------------------------------------
 
-# ============================================================
-# Check environment
-# ============================================================
-
-echo "========================================"
-echo "Block Ads Update"
-echo "========================================"
-
-if [ -z "${API_TOKEN:-}" ]; then
-    error "API_TOKEN is not set."
+if [[ -z "$API_TOKEN" ]]; then
+    error "API_TOKEN GitHub secret is missing."
 fi
 
-if [ -z "${ACCOUNT_ID:-}" ]; then
-    error "ACCOUNT_ID is not set."
+if [[ -z "$ACCOUNT_ID" ]]; then
+    error "ACCOUNT_ID GitHub secret is missing."
 fi
 
-echo "Cloudflare account: ${ACCOUNT_ID}"
-echo ""
+echo "Cloudflare account: ${ACCOUNT_ID:0:6}******"
 
+# --------------------------------------------------
+# Headers
+# --------------------------------------------------
 
-# ============================================================
-# Download latest OISD domains list
-# ============================================================
+AUTH_HEADERS=(
+    -H "Authorization: Bearer ${API_TOKEN}"
+    -H "Content-Type: application/json"
+)
+
+# --------------------------------------------------
+# Download latest OISD list
+# --------------------------------------------------
 
 echo "Downloading latest OISD domain list..."
 
-if ! curl \
-    --fail \
-    --silent \
-    --show-error \
-    --location \
-    --retry "${MAX_RETRIES}" \
+curl -sSfL \
+    --retry "$MAX_RETRIES" \
     --retry-all-errors \
-    --connect-timeout 20 \
+    --connect-timeout 15 \
     --max-time 120 \
-    "${DOMAINS_URL}" \
-    | grep -vE '^[[:space:]]*(#|$)' \
-    > "${DOMAINS_FILE}"; then
+    "https://small.oisd.nl/domainswild2" \
+    | grep -vE '^\s*(#|$)' \
+    > "$DOMAIN_FILE" \
+    || error "Failed to download OISD domain list."
 
-    error "Failed to download the OISD domains list."
+if [[ ! -s "$DOMAIN_FILE" ]]; then
+    error "Downloaded domain list is empty."
 fi
 
-
-# ============================================================
-# Check downloaded file
-# ============================================================
-
-if [ ! -s "${DOMAINS_FILE}" ]; then
-    error "The downloaded domains list is empty."
-fi
-
-total_lines=$(wc -l < "${DOMAINS_FILE}")
+total_lines=$(wc -l < "$DOMAIN_FILE")
 
 echo "Downloaded ${total_lines} domains."
 
-if [ "${total_lines}" -gt $((MAX_LIST_SIZE * MAX_LISTS)) ]; then
-    error "The domains list contains ${total_lines} lines, which exceeds the maximum allowed."
+if (( total_lines > MAX_LIST_SIZE * MAX_LISTS )); then
+    error "Domain list contains ${total_lines} domains, exceeding the maximum of $((MAX_LIST_SIZE * MAX_LISTS))."
 fi
 
+# --------------------------------------------------
+# Check whether list changed
+# --------------------------------------------------
 
-# ============================================================
-# Check whether domains changed
-# ============================================================
-
-if git diff --quiet -- "${DOMAINS_FILE}"; then
-    echo ""
+if git diff --quiet -- "$DOMAIN_FILE"; then
     echo "The domains list has not changed."
-    echo "Nothing needs to be updated."
-    echo ""
+    echo "Nothing to update."
     exit 0
 fi
 
 echo "The domains list has changed."
-echo ""
 
-
-# ============================================================
-# Calculate number of Cloudflare lists required
-# ============================================================
+# --------------------------------------------------
+# Calculate required lists
+# --------------------------------------------------
 
 total_lists=$((total_lines / MAX_LIST_SIZE))
 
-if [ $((total_lines % MAX_LIST_SIZE)) -ne 0 ]; then
+if (( total_lines % MAX_LIST_SIZE != 0 )); then
     total_lists=$((total_lists + 1))
 fi
 
 echo "Cloudflare lists required: ${total_lists}"
 
-
-# ============================================================
-# Cloudflare API helper
-# ============================================================
-
-cloudflare_get() {
-    local endpoint="$1"
-
-    curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry "${MAX_RETRIES}" \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --max-time 120 \
-        -X GET \
-        "${CLOUDFLARE_API}${endpoint}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json"
-}
-
-
-cloudflare_post() {
-    local endpoint="$1"
-    local payload="$2"
-
-    curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry "${MAX_RETRIES}" \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --max-time 120 \
-        -X POST \
-        "${CLOUDFLARE_API}${endpoint}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "${payload}"
-}
-
-
-cloudflare_patch() {
-    local endpoint="$1"
-    local payload="$2"
-
-    curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry "${MAX_RETRIES}" \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --max-time 120 \
-        -X PATCH \
-        "${CLOUDFLARE_API}${endpoint}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "${payload}"
-}
-
-
-cloudflare_put() {
-    local endpoint="$1"
-    local payload="$2"
-
-    curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry "${MAX_RETRIES}" \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --max-time 120 \
-        -X PUT \
-        "${CLOUDFLARE_API}${endpoint}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "${payload}"
-}
-
-
-cloudflare_delete() {
-    local endpoint="$1"
-
-    curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry "${MAX_RETRIES}" \
-        --retry-all-errors \
-        --connect-timeout 20 \
-        --max-time 120 \
-        -X DELETE \
-        "${CLOUDFLARE_API}${endpoint}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json"
-}
-
-
-# ============================================================
+# --------------------------------------------------
 # Test Cloudflare authentication
-# ============================================================
+# --------------------------------------------------
 
-echo ""
 echo "Testing Cloudflare API authentication..."
 
-current_lists=$(cloudflare_get \
-    "/accounts/${ACCOUNT_ID}/gateway/lists") || \
-    error "Failed to get Cloudflare Gateway lists. Check API_TOKEN, ACCOUNT_ID and token permissions."
+auth_response=$(curl -sS \
+    --retry "$MAX_RETRIES" \
+    --retry-all-errors \
+    --connect-timeout 15 \
+    --max-time 60 \
+    "${AUTH_HEADERS[@]}" \
+    "${LISTS_URL}?type=DOMAIN")
 
-if ! echo "${current_lists}" | jq -e '.success == true' >/dev/null; then
-    echo "${current_lists}" | jq .
-    error "Cloudflare returned an API error while getting Gateway lists."
+if ! echo "$auth_response" | jq -e '.success == true' >/dev/null 2>&1; then
+    echo "$auth_response" | jq . 2>/dev/null || echo "$auth_response"
+    error "Cloudflare API authentication failed."
 fi
 
 echo "Cloudflare authentication successful."
 
+# --------------------------------------------------
+# Get current Gateway lists
+# --------------------------------------------------
 
-# ============================================================
-# Get current policies
-# ============================================================
+echo "Getting Cloudflare Gateway lists..."
 
-echo ""
-echo "Getting Cloudflare Gateway policies..."
+current_lists=$(curl -sS \
+    --retry "$MAX_RETRIES" \
+    --retry-all-errors \
+    --connect-timeout 15 \
+    --max-time 120 \
+    "${AUTH_HEADERS[@]}" \
+    "${LISTS_URL}?type=DOMAIN")
 
-current_policies=$(cloudflare_get \
-    "/accounts/${ACCOUNT_ID}/gateway/rules") || \
-    error "Failed to get Cloudflare Gateway policies."
-
-if ! echo "${current_policies}" | jq -e '.success == true' >/dev/null; then
-    echo "${current_policies}" | jq .
-    error "Cloudflare returned an API error while getting Gateway policies."
+if ! echo "$current_lists" | jq -e '.success == true' >/dev/null 2>&1; then
+    echo "$current_lists" | jq . 2>/dev/null || echo "$current_lists"
+    error "Failed to get Cloudflare Gateway lists."
 fi
 
+# --------------------------------------------------
+# Find our existing Block ads lists
+# --------------------------------------------------
 
-# ============================================================
-# Count existing Block ads lists
-# ============================================================
-
-current_lists_count=$(
-    echo "${current_lists}" |
-    jq -r --arg PREFIX "${PREFIX}" '
-        [.result[]? |
-        select(.name | contains($PREFIX))] |
-        length
+mapfile -t existing_list_ids < <(
+    echo "$current_lists" |
+    jq -r --arg PREFIX "$PREFIX" '
+        .result[]
+        | select(.name | startswith($PREFIX))
+        | .id
     '
-) || error "Failed to count existing Block ads lists."
+)
 
+existing_count=${#existing_list_ids[@]}
 
-current_lists_count_without_prefix=$(
-    echo "${current_lists}" |
-    jq -r --arg PREFIX "${PREFIX}" '
-        [.result[]? |
-        select((.name | contains($PREFIX)) | not)] |
-        length
+echo "Existing Block ads lists: ${existing_count}"
+
+# --------------------------------------------------
+# Check list capacity
+# --------------------------------------------------
+
+current_other_count=$(
+    echo "$current_lists" |
+    jq -r --arg PREFIX "$PREFIX" '
+        [
+            .result[]
+            | select((.name | startswith($PREFIX)) | not)
+        ] | length
     '
-) || error "Failed to count non-Block ads lists."
+)
 
+echo "Other Cloudflare lists: ${current_other_count}"
 
-echo "Existing Block ads lists: ${current_lists_count}"
-echo "Other Cloudflare lists: ${current_lists_count_without_prefix}"
+available_slots=$((MAX_LISTS - current_other_count))
 
-
-# ============================================================
-# Check list limit
-# ============================================================
-
-available_slots=$((MAX_LISTS - current_lists_count_without_prefix))
-
-if [ "${total_lists}" -gt "${available_slots}" ]; then
-    error "Need ${total_lists} Block ads lists, but only ${available_slots} list slots are available."
+if (( total_lists > available_slots )); then
+    error "Need ${total_lists} lists but only ${available_slots} list slots are available."
 fi
 
+# --------------------------------------------------
+# Split domains into chunks
+# --------------------------------------------------
 
-# ============================================================
-# Split domain list
-# ============================================================
-
-echo ""
 echo "Splitting domains into chunks..."
 
-rm -f "${DOMAINS_FILE}."*
+rm -f "${CHUNK_PREFIX}"*
 
-split \
-    -l "${MAX_LIST_SIZE}" \
-    "${DOMAINS_FILE}" \
-    "${DOMAINS_FILE}." || \
-    error "Failed to split the domains list."
+split -l "$MAX_LIST_SIZE" \
+    "$DOMAIN_FILE" \
+    "$CHUNK_PREFIX" \
+    || error "Failed to split domain list."
 
+mapfile -t chunked_lists < <(
+    find . -maxdepth 1 -type f -name "${CHUNK_PREFIX}*" | sort
+)
 
-chunked_lists=()
-
-for file in "${DOMAINS_FILE}."*; do
-    if [ -f "${file}" ]; then
-        chunked_lists+=("${file}")
-    fi
-done
-
-
-if [ "${#chunked_lists[@]}" -eq 0 ]; then
-    error "No domain chunks were created."
+if (( ${#chunked_lists[@]} != total_lists )); then
+    error "Expected ${total_lists} chunks but created ${#chunked_lists[@]}."
 fi
 
 echo "Created ${#chunked_lists[@]} chunks."
 
-
-# ============================================================
-# Arrays
-# ============================================================
+# --------------------------------------------------
+# Used/excess list tracking
+# --------------------------------------------------
 
 used_list_ids=()
 excess_list_ids=()
 
-list_counter=1
-
-
-# ============================================================
+# --------------------------------------------------
 # Update existing lists
-# ============================================================
+# --------------------------------------------------
 
-if [ "${current_lists_count}" -gt 0 ]; then
+list_index=0
 
-    existing_ids=$(
-        echo "${current_lists}" |
-        jq -r --arg PREFIX "${PREFIX}" '
-            .result[]? |
-            select(.name | contains($PREFIX)) |
-            .id
-        '
-    ) || error "Failed to get existing Block ads list IDs."
+for list_id in "${existing_list_ids[@]}"; do
 
+    if (( list_index >= total_lists )); then
+        echo "Marking excess list ${list_id} for deletion..."
+        excess_list_ids+=("$list_id")
+        continue
+    fi
 
-    while IFS= read -r list_id; do
-
-        [ -z "${list_id}" ] && continue
-
-        if [ "${#chunked_lists[@]}" -eq 0 ]; then
-            echo "Marking list ${list_id} for deletion..."
-            excess_list_ids+=("${list_id}")
-            continue
-        fi
-
-        echo ""
-        echo "Updating list ${list_id}..."
-
-        list_items=$(
-            cloudflare_get \
-            "/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}/items?limit=${MAX_LIST_SIZE}"
-        ) || error "Failed to get list ${list_id} contents."
-
-
-        if ! echo "${list_items}" | jq -e '.success == true' >/dev/null; then
-            echo "${list_items}" | jq .
-            error "Cloudflare returned an error while reading list ${list_id}."
-        fi
-
-
-        list_items_values=$(
-            echo "${list_items}" |
-            jq -c '
-                [.result[]? |
-                .value |
-                select(. != null)]
-            '
-        ) || error "Failed to read existing list items."
-
-
-        list_items_array=$(
-            jq -R -s '
-                split("\n") |
-                map(
-                    select(length > 0) |
-                    {
-                        "value": .
-                    }
-                )
-            ' "${chunked_lists[0]}"
-        ) || error "Failed to create new list items."
-
-
-        payload=$(
-            jq -n \
-                --argjson append_items "${list_items_array}" \
-                --argjson remove_items "${list_items_values}" \
-                '{
-                    "append": $append_items,
-                    "remove": $remove_items
-                }'
-        ) || error "Failed to create Cloudflare update payload."
-
-
-        list=$(
-            cloudflare_patch \
-                "/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}" \
-                "${payload}"
-        ) || error "Failed to update Cloudflare list ${list_id}."
-
-
-        if ! echo "${list}" | jq -e '.success == true' >/dev/null; then
-            echo "${list}" | jq .
-            error "Cloudflare rejected the update for list ${list_id}."
-        fi
-
-
-        used_list_ids+=("${list_id}")
-
-        rm -f "${chunked_lists[0]}"
-
-        chunked_lists=(
-            "${chunked_lists[@]:1}"
-        )
-
-        list_counter=$((list_counter + 1))
-
-    done <<< "${existing_ids}"
-
-fi
-
-
-# ============================================================
-# Create new lists
-# ============================================================
-
-for file in "${chunked_lists[@]}"; do
+    chunk_file="${chunked_lists[$list_index]}"
 
     echo ""
-    echo "Creating Cloudflare list..."
+    echo "Updating list $((list_index + 1))/${total_lists}: ${list_id}"
 
-    formatted_counter=$(printf "%03d" "${list_counter}")
-
-    list_name="${PREFIX} - ${formatted_counter}"
-
-
-    items=$(
+    # Build list items.
+    items_json=$(
         jq -R -s '
-            split("\n") |
-            map(
-                select(length > 0) |
-                {
-                    "value": .
-                }
-            )
-        ' "${file}"
-    ) || error "Failed to create items for ${list_name}."
+            split("\n")
+            | map(select(length > 0) | {
+                value: .
+            })
+        ' "$chunk_file"
+    ) || error "Failed to create JSON for ${list_id}."
 
+    # Get the existing list name so PUT does not accidentally rename it.
+    list_details=$(curl -sS \
+        --retry "$MAX_RETRIES" \
+        --retry-all-errors \
+        --connect-timeout 15 \
+        --max-time 120 \
+        "${AUTH_HEADERS[@]}" \
+        "${LISTS_URL}/${list_id}")
+
+    if ! echo "$list_details" | jq -e '.success == true' >/dev/null 2>&1; then
+        echo "$list_details" | jq . 2>/dev/null || echo "$list_details"
+        error "Failed to get details for list ${list_id}."
+    fi
+
+    list_name=$(echo "$list_details" | jq -r '.result.name')
+
+    if [[ -z "$list_name" || "$list_name" == "null" ]]; then
+        error "Could not determine name for list ${list_id}."
+    fi
 
     payload=$(
         jq -n \
-            --arg name "${list_name}" \
-            --argjson items "${items}" \
+            --arg name "$list_name" \
+            --argjson items "$items_json" \
             '{
-                "name": $name,
-                "type": "DOMAIN",
-                "items": $items
+                name: $name,
+                items: $items
             }'
-    ) || error "Failed to create payload for ${list_name}."
-
-
-    list=$(
-        cloudflare_post \
-            "/accounts/${ACCOUNT_ID}/gateway/lists" \
-            "${payload}"
-    ) || error "Failed to create Cloudflare list ${list_name}."
-
-
-    if ! echo "${list}" | jq -e '.success == true' >/dev/null; then
-        echo "${list}" | jq .
-        error "Cloudflare rejected creation of ${list_name}."
-    fi
-
-
-    list_id=$(
-        echo "${list}" |
-        jq -r '.result.id // empty'
     )
 
+    # --------------------------------------------------
+    # PUT replaces the existing list items.
+    # --------------------------------------------------
 
-    if [ -z "${list_id}" ]; then
-        echo "${list}" | jq .
-        error "Cloudflare did not return a list ID for ${list_name}."
+    success=false
+
+    for attempt in $(seq 1 "$MAX_RETRIES"); do
+
+        echo "  PUT attempt ${attempt}/${MAX_RETRIES}..."
+
+        response=$(curl -sS \
+            -w $'\nHTTP_STATUS:%{http_code}' \
+            --connect-timeout 15 \
+            --max-time 180 \
+            -X PUT \
+            "${AUTH_HEADERS[@]}" \
+            --data "$payload" \
+            "${LISTS_URL}/${list_id}")
+
+        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+
+        if [[ "$http_status" == "200" ]] &&
+           echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
+
+            echo "  Updated successfully."
+            success=true
+            break
+        fi
+
+        echo "  Cloudflare returned HTTP ${http_status}."
+
+        echo "$body" |
+            jq -r '.errors[]?.message // empty' 2>/dev/null |
+            sed 's/^/  Cloudflare: /'
+
+        if [[ "$http_status" == "409" ]]; then
+            echo "  Conflict detected. Waiting before retry..."
+            sleep $((attempt * 5))
+        elif [[ "$http_status" == "429" ]]; then
+            echo "  Rate limited. Waiting before retry..."
+            sleep $((attempt * 10))
+        else
+            echo "  Waiting before retry..."
+            sleep 3
+        fi
+    done
+
+    if [[ "$success" != true ]]; then
+        error "Failed to update Cloudflare list ${list_id} after ${MAX_RETRIES} attempts."
     fi
 
+    used_list_ids+=("$list_id")
 
-    echo "Created ${list_name}: ${list_id}"
-
-    used_list_ids+=("${list_id}")
-
-    rm -f "${file}"
-
-    list_counter=$((list_counter + 1))
+    list_index=$((list_index + 1))
 
 done
 
+# --------------------------------------------------
+# Create missing lists
+# --------------------------------------------------
 
-# ============================================================
-# Verify list IDs
-# ============================================================
+while (( list_index < total_lists )); do
 
-if [ "${#used_list_ids[@]}" -eq 0 ]; then
-    error "No Cloudflare list IDs are available for the policy."
-fi
+    chunk_file="${chunked_lists[$list_index]}"
 
-echo ""
-echo "Lists being used by policy: ${#used_list_ids[@]}"
+    formatted_counter=$(printf "%03d" "$((list_index + 1))")
 
+    list_name="${PREFIX} - ${formatted_counter}"
 
-# ============================================================
-# Find existing Block ads policy
-# ============================================================
+    echo ""
+    echo "Creating list ${list_name}..."
 
-policy_id=$(
-    echo "${current_policies}" |
-    jq -r --arg PREFIX "${PREFIX}" '
-        .result[]? |
-        select(.name == $PREFIX) |
-        .id
-    ' |
-    head -n 1
-) || error "Failed to find existing Block ads policy."
+    items_json=$(
+        jq -R -s '
+            split("\n")
+            | map(select(length > 0) | {
+                value: .
+            })
+        ' "$chunk_file"
+    ) || error "Failed to create JSON for ${list_name}."
 
+    payload=$(
+        jq -n \
+            --arg name "$list_name" \
+            --argjson items "$items_json" \
+            '{
+                name: $name,
+                type: "DOMAIN",
+                items: $items
+            }'
+    )
 
-# ============================================================
-# Build policy expression
-# ============================================================
+    success=false
 
-if [ "${#used_list_ids[@]}" -eq 1 ]; then
+    for attempt in $(seq 1 "$MAX_RETRIES"); do
 
-    list_id="${used_list_ids[0]}"
+        echo "  POST attempt ${attempt}/${MAX_RETRIES}..."
 
-    expression=$(jq -n \
-        --arg list_id "${list_id}" \
-        '{
-            "any": {
-                "in": {
-                    "lhs": {
-                        "splat": "dns.domains"
-                    },
-                    "rhs": ("$" + $list_id)
-                }
-            }
-        }'
-    ) || error "Failed to create policy expression."
+        response=$(curl -sS \
+            -w $'\nHTTP_STATUS:%{http_code}' \
+            --connect-timeout 15 \
+            --max-time 180 \
+            -X POST \
+            "${AUTH_HEADERS[@]}" \
+            --data "$payload" \
+            "$LISTS_URL")
 
-else
+        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
 
-    expression_items=()
+        if [[ "$http_status" == "200" ]] &&
+           echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
 
-    for list_id in "${used_list_ids[@]}"; do
+            new_id=$(echo "$body" | jq -r '.result.id')
 
-        expression_items+=(
-            "$(
-                jq -n \
-                    --arg list_id "${list_id}" \
-                    '{
-                        "any": {
-                            "in": {
-                                "lhs": {
-                                    "splat": "dns.domains"
-                                },
-                                "rhs": ("$" + $list_id)
-                            }
-                        }
-                    }'
-            )"
-        )
+            if [[ -z "$new_id" || "$new_id" == "null" ]]; then
+                error "Cloudflare created ${list_name}, but no list ID was returned."
+            fi
+
+            echo "  Created successfully: ${new_id}"
+
+            used_list_ids+=("$new_id")
+            success=true
+            break
+        fi
+
+        echo "  Cloudflare returned HTTP ${http_status}."
+
+        echo "$body" |
+            jq -r '.errors[]?.message // empty' 2>/dev/null |
+            sed 's/^/  Cloudflare: /'
+
+        if [[ "$http_status" == "409" ]]; then
+            echo "  Conflict detected. Waiting before retry..."
+            sleep $((attempt * 5))
+        elif [[ "$http_status" == "429" ]]; then
+            echo "  Rate limited. Waiting before retry..."
+            sleep $((attempt * 10))
+        else
+            sleep 3
+        fi
 
     done
 
-
-    conditions_json=$(
-        printf '%s\n' "${expression_items[@]}" |
-        jq -s .
-    ) || error "Failed to create policy conditions."
-
-
-    expression=$(
-        jq -n \
-            --argjson conditions "${conditions_json}" \
-            '{
-                "or": $conditions
-            }'
-    ) || error "Failed to create policy expression."
-
-fi
-
-
-# ============================================================
-# Build complete policy JSON
-# ============================================================
-
-json_data=$(
-    jq -n \
-        --arg name "${PREFIX}" \
-        --argjson expression "${expression}" \
-        '{
-            "name": $name,
-            "conditions": [
-                {
-                    "type": "traffic",
-                    "expression": $expression
-                }
-            ],
-            "action": "block",
-            "enabled": true,
-            "description": "",
-            "rule_settings": {
-                "block_page_enabled": false,
-                "block_reason": "",
-                "biso_admin_controls": {
-                    "dcp": false,
-                    "dcr": false,
-                    "dd": false,
-                    "dk": false,
-                    "dp": false,
-                    "du": false
-                },
-                "add_headers": {},
-                "ip_categories": false,
-                "override_host": "",
-                "override_ips": null,
-                "l4override": null,
-                "check_session": null
-            },
-            "filters": [
-                "dns"
-            ]
-        }'
-) || error "Failed to create policy JSON."
-
-
-echo ""
-echo "Policy JSON generated successfully."
-
-
-# ============================================================
-# Create or update policy
-# ============================================================
-
-if [ -z "${policy_id}" ] || [ "${policy_id}" = "null" ]; then
-
-    echo ""
-    echo "Creating Block ads policy..."
-
-    policy_response=$(
-        cloudflare_post \
-            "/accounts/${ACCOUNT_ID}/gateway/rules" \
-            "${json_data}"
-    ) || error "Failed to create Block ads policy."
-
-
-    if ! echo "${policy_response}" | jq -e '.success == true' >/dev/null; then
-        echo "${policy_response}" | jq .
-        error "Cloudflare rejected the Block ads policy."
+    if [[ "$success" != true ]]; then
+        error "Failed to create Cloudflare list ${list_name}."
     fi
 
-    echo "Block ads policy created."
+    list_index=$((list_index + 1))
 
-else
+done
 
-    echo ""
-    echo "Updating Block ads policy ${policy_id}..."
-
-    policy_response=$(
-        cloudflare_put \
-            "/accounts/${ACCOUNT_ID}/gateway/rules/${policy_id}" \
-            "${json_data}"
-    ) || error "Failed to update Block ads policy."
-
-
-    if ! echo "${policy_response}" | jq -e '.success == true' >/dev/null; then
-        echo "${policy_response}" | jq .
-        error "Cloudflare rejected the Block ads policy update."
-    fi
-
-    echo "Block ads policy updated."
-
-fi
-
-
-# ============================================================
+# --------------------------------------------------
 # Delete excess lists
-# ============================================================
+# --------------------------------------------------
 
 for list_id in "${excess_list_ids[@]}"; do
 
     echo ""
     echo "Deleting excess list ${list_id}..."
 
-    delete_response=$(
-        cloudflare_delete \
-            "/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}"
-    ) || error "Failed to delete list ${list_id}."
+    response=$(curl -sS \
+        -w $'\nHTTP_STATUS:%{http_code}' \
+        --connect-timeout 15 \
+        --max-time 120 \
+        -X DELETE \
+        "${AUTH_HEADERS[@]}" \
+        "${LISTS_URL}/${list_id}")
 
+    http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+    body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
 
-    if ! echo "${delete_response}" | jq -e '.success == true' >/dev/null 2>&1; then
+    if [[ "$http_status" != "200" ]] &&
+       [[ "$http_status" != "204" ]]; then
 
-        # Some DELETE responses may have an empty body.
-        if [ -n "${delete_response}" ]; then
-            echo "${delete_response}" | jq .
-            error "Cloudflare rejected deletion of list ${list_id}."
-        fi
+        echo "$body" | jq . 2>/dev/null || echo "$body"
 
+        error "Failed to delete excess list ${list_id}."
     fi
+
+    echo "  Deleted successfully."
 
 done
 
-
-# ============================================================
-# Commit updated domains file
-# ============================================================
+# --------------------------------------------------
+# Get current Gateway rules
+# --------------------------------------------------
 
 echo ""
-echo "Preparing Git commit..."
+echo "Getting Cloudflare Gateway policies..."
 
-git config user.email \
-    "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+current_policies=$(curl -sS \
+    --retry "$MAX_RETRIES" \
+    --retry-all-errors \
+    --connect-timeout 15 \
+    --max-time 120 \
+    "${AUTH_HEADERS[@]}" \
+    "$RULES_URL")
 
-git config user.name \
-    "${GITHUB_ACTOR}"
+if ! echo "$current_policies" | jq -e '.success == true' >/dev/null 2>&1; then
+    echo "$current_policies" | jq . 2>/dev/null || echo "$current_policies"
+    error "Failed to get Cloudflare Gateway policies."
+fi
 
+# --------------------------------------------------
+# Find existing Block ads policy
+# --------------------------------------------------
 
-git add "${DOMAINS_FILE}" || \
-    error "Failed to add ${DOMAINS_FILE} to Git."
+policy_id=$(
+    echo "$current_policies" |
+    jq -r --arg PREFIX "$PREFIX" '
+        .result[]
+        | select(.name == $PREFIX)
+        | .id
+    ' |
+    head -n 1
+)
 
+# --------------------------------------------------
+# Build policy expression
+# --------------------------------------------------
 
-# Check whether there is actually something to commit.
+echo "Building Block ads policy..."
 
-if git diff --cached --quiet; then
+if (( ${#used_list_ids[@]} == 0 )); then
+    error "No Cloudflare lists are available for the policy."
+fi
 
-    echo "No Git changes to commit."
+expressions=()
+
+for list_id in "${used_list_ids[@]}"; do
+    expressions+=(
+        "{\"any\":{\"in\":{\"lhs\":{\"splat\":\"dns.domains\"},\"rhs\":\"\$${list_id}\"}}}"
+    )
+done
+
+if (( ${#expressions[@]} == 1 )); then
+    expression_json="${expressions[0]}"
+else
+    joined=$(IFS=','; echo "${expressions[*]}")
+    expression_json="{\"or\":[${joined}]}"
+fi
+
+json_data=$(
+    jq -n \
+        --arg name "$PREFIX" \
+        --argjson expression "$expression_json" \
+        '{
+            name: $name,
+            conditions: [
+                {
+                    type: "traffic",
+                    expression: $expression
+                }
+            ],
+            action: "block",
+            enabled: true,
+            description: "",
+            rule_settings: {
+                block_page_enabled: false,
+                block_reason: "",
+                biso_admin_controls: {
+                    dcp: false,
+                    dcr: false,
+                    dd: false,
+                    dk: false,
+                    dp: false,
+                    du: false
+                },
+                add_headers: {},
+                ip_categories: false,
+                override_host: "",
+                override_ips: null,
+                l4override: null,
+                check_session: null
+            },
+            filters: ["dns"]
+        }'
+) || error "Failed to build Gateway policy JSON."
+
+# --------------------------------------------------
+# Create/update policy
+# --------------------------------------------------
+
+if [[ -z "$policy_id" || "$policy_id" == "null" ]]; then
+
+    echo "Creating Block ads policy..."
+
+    response=$(curl -sS \
+        -w $'\nHTTP_STATUS:%{http_code}' \
+        --connect-timeout 15 \
+        --max-time 120 \
+        -X POST \
+        "${AUTH_HEADERS[@]}" \
+        --data "$json_data" \
+        "$RULES_URL")
+
+    http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+    body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+
+    if [[ "$http_status" != "200" ]] ||
+       ! echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
+
+        echo "$body" | jq . 2>/dev/null || echo "$body"
+
+        error "Failed to create Block ads policy."
+    fi
+
+    echo "Block ads policy created."
 
 else
 
-    git commit \
-        -m "Update domains list" || \
-        error "Failed to commit the domains list."
+    echo "Updating Block ads policy ${policy_id}..."
 
+    response=$(curl -sS \
+        -w $'\nHTTP_STATUS:%{http_code}' \
+        --connect-timeout 15 \
+        --max-time 120 \
+        -X PUT \
+        "${AUTH_HEADERS[@]}" \
+        --data "$json_data" \
+        "${RULES_URL}/${policy_id}")
 
-    echo "Pushing updated domains list..."
+    http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+    body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
 
-    git push origin main || \
-        error "Failed to push the domains list to main."
+    if [[ "$http_status" != "200" ]] ||
+       ! echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
+
+        echo "$body" | jq . 2>/dev/null || echo "$body"
+
+        error "Failed to update Block ads policy."
+    fi
+
+    echo "Block ads policy updated."
 
 fi
 
+# --------------------------------------------------
+# Clean up temporary chunks
+# --------------------------------------------------
 
-# ============================================================
-# Cleanup
-# ============================================================
+rm -f "${CHUNK_PREFIX}"*
 
-rm -f "${DOMAINS_FILE}."*
+# --------------------------------------------------
+# Commit updated domain file
+# --------------------------------------------------
 
+echo ""
+echo "Updating repository..."
+
+git config user.email \
+    "${GITHUB_ACTOR_ID:-github-actions[bot]}+${GITHUB_ACTOR:-github-actions[bot]}@users.noreply.github.com"
+
+git config user.name \
+    "${GITHUB_ACTOR:-github-actions[bot]}"
+
+git add "$DOMAIN_FILE" || error "Failed to stage domain list."
+
+if git diff --cached --quiet; then
+    echo "No repository changes to commit."
+else
+
+    git commit \
+        -m "Update domains list" \
+        || error "Failed to commit the domains list."
+
+    git push origin HEAD:main \
+        || error "Failed to push the updated domains list."
+fi
 
 echo ""
 echo "========================================"
 echo "SUCCESS"
 echo "========================================"
-echo "Block ads list update completed."
+echo "Block ads update completed successfully."
 echo "Domains: ${total_lines}"
 echo "Cloudflare lists: ${#used_list_ids[@]}"
 echo "========================================"
