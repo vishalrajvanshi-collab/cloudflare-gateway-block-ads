@@ -2,32 +2,58 @@ name: Block ads update
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: "0 * * * *"
   push:
     branches:
-      - '**'
+      - "**"
+  workflow_dispatch:
 
 jobs:
   block_ads_update:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Install jq, curl and other utilities
+      - name: Install required utilities
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl coreutils
+
+      - name: Check required secrets
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+        run: |
+          if [ -z "$API_TOKEN" ]; then
+            echo "::error::API_TOKEN secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::ACCOUNT_ID secret is missing."
+            exit 1
+          fi
+
+          echo "Cloudflare secrets are configured."
 
       - name: Make script executable
         run: |
           chmod +x block_ads.sh
 
-      - name: Run the script
+      - name: Run block ads update
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
           ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_ACTOR_ID: ${{ github.actor_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           ./block_ads.sh
