@@ -15,6 +15,7 @@ PREFIX="Block ads"
 MAX_LIST_SIZE=1000
 MAX_LISTS=100
 MAX_RETRIES=10
+PER_PAGE=100
 
 DOMAIN_FILE="oisd_small_domainswild2.txt"
 CHUNK_PREFIX="oisd_small_domainswild2.txt."
@@ -37,6 +38,7 @@ error() {
     echo "========================================"
     echo "$1"
     echo ""
+
     rm -f "${CHUNK_PREFIX}"*
     exit 1
 }
@@ -117,7 +119,7 @@ fi
 echo "Cloudflare lists required: ${total_lists}"
 
 # --------------------------------------------------
-# Test Cloudflare authentication
+# Test Cloudflare API authentication
 # --------------------------------------------------
 
 echo "Testing Cloudflare API authentication..."
@@ -128,7 +130,7 @@ auth_response=$(curl -sS \
     --connect-timeout 15 \
     --max-time 60 \
     "${AUTH_HEADERS[@]}" \
-    "${LISTS_URL}?type=DOMAIN")
+    "${LISTS_URL}?type=DOMAIN&per_page=${PER_PAGE}&page=1")
 
 if ! echo "$auth_response" | jq -e '.success == true' >/dev/null 2>&1; then
     echo "$auth_response" | jq . 2>/dev/null || echo "$auth_response"
@@ -138,56 +140,125 @@ fi
 echo "Cloudflare authentication successful."
 
 # --------------------------------------------------
-# Get current Gateway lists
+# Get ALL Cloudflare Gateway lists
 # --------------------------------------------------
 
 echo "Getting Cloudflare Gateway lists..."
 
-current_lists=$(curl -sS \
-    --retry "$MAX_RETRIES" \
-    --retry-all-errors \
-    --connect-timeout 15 \
-    --max-time 120 \
-    "${AUTH_HEADERS[@]}" \
-    "${LISTS_URL}?type=DOMAIN")
+all_lists='{"result":[],"success":true}'
 
-if ! echo "$current_lists" | jq -e '.success == true' >/dev/null 2>&1; then
-    echo "$current_lists" | jq . 2>/dev/null || echo "$current_lists"
-    error "Failed to get Cloudflare Gateway lists."
-fi
+page=1
+
+while true; do
+
+    echo "  Getting lists page ${page}..."
+
+    response=$(curl -sS \
+        --retry "$MAX_RETRIES" \
+        --retry-all-errors \
+        --connect-timeout 15 \
+        --max-time 120 \
+        "${AUTH_HEADERS[@]}" \
+        "${LISTS_URL}?type=DOMAIN&per_page=${PER_PAGE}&page=${page}")
+
+    if ! echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
+        echo "$response" | jq . 2>/dev/null || echo "$response"
+        error "Failed to get Cloudflare Gateway lists."
+    fi
+
+    page_results=$(echo "$response" | jq '.result // []')
+
+    all_lists=$(
+        jq -n \
+            --argjson existing "$(echo "$all_lists" | jq '.result')" \
+            --argjson new "$page_results" \
+            '{
+                result: ($existing + $new),
+                success: true
+            }'
+    ) || error "Failed to combine Cloudflare list results."
+
+    current_page=$(echo "$response" | jq -r '.result_info.page // 1')
+    total_pages=$(echo "$response" | jq -r '.result_info.total_pages // 1')
+
+    echo "  Page ${current_page}/${total_pages}: $(echo "$page_results" | jq 'length') lists."
+
+    if (( page >= total_pages )); then
+        break
+    fi
+
+    page=$((page + 1))
+
+done
+
+total_cloudflare_lists=$(echo "$all_lists" | jq '.result | length')
+
+echo "Total Cloudflare DOMAIN lists found: ${total_cloudflare_lists}"
 
 # --------------------------------------------------
-# Find our existing Block ads lists
+# Find existing Block ads lists by NAME
 # --------------------------------------------------
 
-mapfile -t existing_list_ids < <(
-    echo "$current_lists" |
+declare -A existing_lists
+
+while IFS=$'\t' read -r list_name list_id; do
+
+    [[ -z "$list_name" || -z "$list_id" ]] && continue
+
+    existing_lists["$list_name"]="$list_id"
+
+done < <(
+    echo "$all_lists" |
     jq -r --arg PREFIX "$PREFIX" '
         .result[]
+        | select(.type == "DOMAIN")
         | select(.name | startswith($PREFIX))
-        | .id
+        | [.name, .id]
+        | @tsv
     '
 )
 
-existing_count=${#existing_list_ids[@]}
+existing_count=${#existing_lists[@]}
 
 echo "Existing Block ads lists: ${existing_count}"
+
+# --------------------------------------------------
+# Display discovered Block ads lists
+# --------------------------------------------------
+
+if (( existing_count > 0 )); then
+
+    echo "Discovered Block ads lists:"
+
+    for i in $(seq 1 "$MAX_LISTS"); do
+
+        formatted_counter=$(printf "%03d" "$i")
+        expected_name="${PREFIX} - ${formatted_counter}"
+
+        if [[ -n "${existing_lists[$expected_name]+x}" ]]; then
+            echo "  ${expected_name}: ${existing_lists[$expected_name]}"
+        fi
+
+    done
+
+fi
 
 # --------------------------------------------------
 # Check list capacity
 # --------------------------------------------------
 
 current_other_count=$(
-    echo "$current_lists" |
+    echo "$all_lists" |
     jq -r --arg PREFIX "$PREFIX" '
         [
             .result[]
+            | select((.type == "DOMAIN"))
             | select((.name | startswith($PREFIX)) | not)
         ] | length
     '
 )
 
-echo "Other Cloudflare lists: ${current_other_count}"
+echo "Other Cloudflare DOMAIN lists: ${current_other_count}"
 
 available_slots=$((MAX_LISTS - current_other_count))
 
@@ -219,143 +290,29 @@ fi
 echo "Created ${#chunked_lists[@]} chunks."
 
 # --------------------------------------------------
-# Used/excess list tracking
+# Used list tracking
 # --------------------------------------------------
 
 used_list_ids=()
-excess_list_ids=()
 
 # --------------------------------------------------
-# Update existing lists
+# Update/create lists by exact NAME
 # --------------------------------------------------
 
-list_index=0
+for ((list_number=1; list_number<=total_lists; list_number++)); do
 
-for list_id in "${existing_list_ids[@]}"; do
-
-    if (( list_index >= total_lists )); then
-        echo "Marking excess list ${list_id} for deletion..."
-        excess_list_ids+=("$list_id")
-        continue
-    fi
-
-    chunk_file="${chunked_lists[$list_index]}"
-
-    echo ""
-    echo "Updating list $((list_index + 1))/${total_lists}: ${list_id}"
-
-    # Build list items.
-    items_json=$(
-        jq -R -s '
-            split("\n")
-            | map(select(length > 0) | {
-                value: .
-            })
-        ' "$chunk_file"
-    ) || error "Failed to create JSON for ${list_id}."
-
-    # Get the existing list name so PUT does not accidentally rename it.
-    list_details=$(curl -sS \
-        --retry "$MAX_RETRIES" \
-        --retry-all-errors \
-        --connect-timeout 15 \
-        --max-time 120 \
-        "${AUTH_HEADERS[@]}" \
-        "${LISTS_URL}/${list_id}")
-
-    if ! echo "$list_details" | jq -e '.success == true' >/dev/null 2>&1; then
-        echo "$list_details" | jq . 2>/dev/null || echo "$list_details"
-        error "Failed to get details for list ${list_id}."
-    fi
-
-    list_name=$(echo "$list_details" | jq -r '.result.name')
-
-    if [[ -z "$list_name" || "$list_name" == "null" ]]; then
-        error "Could not determine name for list ${list_id}."
-    fi
-
-    payload=$(
-        jq -n \
-            --arg name "$list_name" \
-            --argjson items "$items_json" \
-            '{
-                name: $name,
-                items: $items
-            }'
-    )
-
-    # --------------------------------------------------
-    # PUT replaces the existing list items.
-    # --------------------------------------------------
-
-    success=false
-
-    for attempt in $(seq 1 "$MAX_RETRIES"); do
-
-        echo "  PUT attempt ${attempt}/${MAX_RETRIES}..."
-
-        response=$(curl -sS \
-            -w $'\nHTTP_STATUS:%{http_code}' \
-            --connect-timeout 15 \
-            --max-time 180 \
-            -X PUT \
-            "${AUTH_HEADERS[@]}" \
-            --data "$payload" \
-            "${LISTS_URL}/${list_id}")
-
-        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
-        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
-
-        if [[ "$http_status" == "200" ]] &&
-           echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
-
-            echo "  Updated successfully."
-            success=true
-            break
-        fi
-
-        echo "  Cloudflare returned HTTP ${http_status}."
-
-        echo "$body" |
-            jq -r '.errors[]?.message // empty' 2>/dev/null |
-            sed 's/^/  Cloudflare: /'
-
-        if [[ "$http_status" == "409" ]]; then
-            echo "  Conflict detected. Waiting before retry..."
-            sleep $((attempt * 5))
-        elif [[ "$http_status" == "429" ]]; then
-            echo "  Rate limited. Waiting before retry..."
-            sleep $((attempt * 10))
-        else
-            echo "  Waiting before retry..."
-            sleep 3
-        fi
-    done
-
-    if [[ "$success" != true ]]; then
-        error "Failed to update Cloudflare list ${list_id} after ${MAX_RETRIES} attempts."
-    fi
-
-    used_list_ids+=("$list_id")
-
-    list_index=$((list_index + 1))
-
-done
-
-# --------------------------------------------------
-# Create missing lists
-# --------------------------------------------------
-
-while (( list_index < total_lists )); do
-
-    chunk_file="${chunked_lists[$list_index]}"
-
-    formatted_counter=$(printf "%03d" "$((list_index + 1))")
-
+    formatted_counter=$(printf "%03d" "$list_number")
     list_name="${PREFIX} - ${formatted_counter}"
 
+    chunk_index=$((list_number - 1))
+    chunk_file="${chunked_lists[$chunk_index]}"
+
     echo ""
-    echo "Creating list ${list_name}..."
+    echo "Processing list ${list_number}/${total_lists}: ${list_name}"
+
+    # --------------------------------------------------
+    # Build list items
+    # --------------------------------------------------
 
     items_json=$(
         jq -R -s '
@@ -366,6 +323,91 @@ while (( list_index < total_lists )); do
         ' "$chunk_file"
     ) || error "Failed to create JSON for ${list_name}."
 
+    # --------------------------------------------------
+    # Existing list -> UPDATE
+    # --------------------------------------------------
+
+    if [[ -n "${existing_lists[$list_name]+x}" ]]; then
+
+        list_id="${existing_lists[$list_name]}"
+
+        echo "  Existing list found: ${list_id}"
+        echo "  Updating list..."
+
+        payload=$(
+            jq -n \
+                --arg name "$list_name" \
+                --argjson items "$items_json" \
+                '{
+                    name: $name,
+                    items: $items
+                }'
+        ) || error "Failed to build update payload for ${list_name}."
+
+        success=false
+
+        for attempt in $(seq 1 "$MAX_RETRIES"); do
+
+            echo "  PUT attempt ${attempt}/${MAX_RETRIES}..."
+
+            response=$(curl -sS \
+                -w $'\nHTTP_STATUS:%{http_code}' \
+                --connect-timeout 15 \
+                --max-time 180 \
+                -X PUT \
+                "${AUTH_HEADERS[@]}" \
+                --data "$payload" \
+                "${LISTS_URL}/${list_id}")
+
+            http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+            body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+
+            if [[ "$http_status" == "200" ]] &&
+               echo "$body" | jq -e '.success == true' >/dev/null 2>&1; then
+
+                echo "  Updated successfully."
+
+                success=true
+                break
+            fi
+
+            echo "  Cloudflare returned HTTP ${http_status}."
+
+            echo "$body" |
+                jq -r '.errors[]?.message // empty' 2>/dev/null |
+                sed 's/^/  Cloudflare: /'
+
+            if [[ "$http_status" == "409" ]]; then
+                echo "  Conflict detected. Waiting before retry..."
+                sleep $((attempt * 5))
+
+            elif [[ "$http_status" == "429" ]]; then
+                echo "  Rate limited. Waiting before retry..."
+                sleep $((attempt * 10))
+
+            else
+                echo "  Waiting before retry..."
+                sleep 3
+            fi
+
+        done
+
+        if [[ "$success" != true ]]; then
+            error "Failed to update ${list_name} (${list_id}) after ${MAX_RETRIES} attempts."
+        fi
+
+        used_list_ids+=("$list_id")
+
+        continue
+    fi
+
+    # --------------------------------------------------
+    # Missing list -> CREATE
+    # --------------------------------------------------
+
+    echo "  List does not exist."
+    echo "  Creating ${list_name}..."
+
     payload=$(
         jq -n \
             --arg name "$list_name" \
@@ -375,7 +417,7 @@ while (( list_index < total_lists )); do
                 type: "DOMAIN",
                 items: $items
             }'
-    )
+    ) || error "Failed to build create payload for ${list_name}."
 
     success=false
 
@@ -407,6 +449,7 @@ while (( list_index < total_lists )); do
             echo "  Created successfully: ${new_id}"
 
             used_list_ids+=("$new_id")
+
             success=true
             break
         fi
@@ -417,55 +460,136 @@ while (( list_index < total_lists )); do
             jq -r '.errors[]?.message // empty' 2>/dev/null |
             sed 's/^/  Cloudflare: /'
 
+        # --------------------------------------------------
+        # IMPORTANT:
+        # If Cloudflare says the list already exists,
+        # refresh the list information and use the existing ID.
+        # --------------------------------------------------
+
         if [[ "$http_status" == "409" ]]; then
+
+            echo "  List already exists. Refreshing Cloudflare lists..."
+
+            refreshed=$(curl -sS \
+                --retry "$MAX_RETRIES" \
+                --retry-all-errors \
+                --connect-timeout 15 \
+                --max-time 120 \
+                "${AUTH_HEADERS[@]}" \
+                "${LISTS_URL}?type=DOMAIN&per_page=${PER_PAGE}&page=1")
+
+            if echo "$refreshed" | jq -e '.success == true' >/dev/null 2>&1; then
+
+                existing_id=$(
+                    echo "$refreshed" |
+                    jq -r --arg NAME "$list_name" '
+                        .result[]
+                        | select(.name == $NAME)
+                        | .id
+                    ' |
+                    head -n 1
+                )
+
+                if [[ -n "$existing_id" && "$existing_id" != "null" ]]; then
+
+                    echo "  Found existing list: ${existing_id}"
+                    echo "  Updating existing list instead."
+
+                    update_response=$(curl -sS \
+                        -w $'\nHTTP_STATUS:%{http_code}' \
+                        --connect-timeout 15 \
+                        --max-time 180 \
+                        -X PUT \
+                        "${AUTH_HEADERS[@]}" \
+                        --data "$payload" \
+                        "${LISTS_URL}/${existing_id}")
+
+                    update_status=$(echo "$update_response" | sed -n 's/^HTTP_STATUS://p')
+                    update_body=$(echo "$update_response" | sed '/^HTTP_STATUS:/d')
+
+                    if [[ "$update_status" == "200" ]] &&
+                       echo "$update_body" | jq -e '.success == true' >/dev/null 2>&1; then
+
+                        echo "  Existing list updated successfully."
+
+                        used_list_ids+=("$existing_id")
+
+                        success=true
+                        break
+                    fi
+
+                    echo "  Failed to update existing list."
+
+                    echo "$update_body" |
+                        jq -r '.errors[]?.message // empty' 2>/dev/null |
+                        sed 's/^/  Cloudflare: /'
+                fi
+            fi
+
             echo "  Conflict detected. Waiting before retry..."
             sleep $((attempt * 5))
+
         elif [[ "$http_status" == "429" ]]; then
+
             echo "  Rate limited. Waiting before retry..."
             sleep $((attempt * 10))
+
         else
+
+            echo "  Waiting before retry..."
             sleep 3
+
         fi
 
     done
 
     if [[ "$success" != true ]]; then
-        error "Failed to create Cloudflare list ${list_name}."
+        error "Failed to create/update ${list_name} after ${MAX_RETRIES} attempts."
     fi
-
-    list_index=$((list_index + 1))
 
 done
 
 # --------------------------------------------------
-# Delete excess lists
+# Delete excess Block ads lists
 # --------------------------------------------------
 
-for list_id in "${excess_list_ids[@]}"; do
+echo ""
+echo "Checking for excess Block ads lists..."
 
-    echo ""
-    echo "Deleting excess list ${list_id}..."
+for i in $(seq "$((total_lists + 1))" "$MAX_LISTS"); do
 
-    response=$(curl -sS \
-        -w $'\nHTTP_STATUS:%{http_code}' \
-        --connect-timeout 15 \
-        --max-time 120 \
-        -X DELETE \
-        "${AUTH_HEADERS[@]}" \
-        "${LISTS_URL}/${list_id}")
+    formatted_counter=$(printf "%03d" "$i")
+    list_name="${PREFIX} - ${formatted_counter}"
 
-    http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
-    body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+    if [[ -n "${existing_lists[$list_name]+x}" ]]; then
 
-    if [[ "$http_status" != "200" ]] &&
-       [[ "$http_status" != "204" ]]; then
+        list_id="${existing_lists[$list_name]}"
 
-        echo "$body" | jq . 2>/dev/null || echo "$body"
+        echo ""
+        echo "Deleting excess list ${list_name} (${list_id})..."
 
-        error "Failed to delete excess list ${list_id}."
+        response=$(curl -sS \
+            -w $'\nHTTP_STATUS:%{http_code}' \
+            --connect-timeout 15 \
+            --max-time 120 \
+            -X DELETE \
+            "${AUTH_HEADERS[@]}" \
+            "${LISTS_URL}/${list_id}")
+
+        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+
+        if [[ "$http_status" != "200" ]] &&
+           [[ "$http_status" != "204" ]]; then
+
+            echo "$body" | jq . 2>/dev/null || echo "$body"
+
+            error "Failed to delete excess list ${list_name} (${list_id})."
+        fi
+
+        echo "  Deleted successfully."
+
     fi
-
-    echo "  Deleted successfully."
 
 done
 
@@ -516,16 +640,22 @@ fi
 expressions=()
 
 for list_id in "${used_list_ids[@]}"; do
+
     expressions+=(
         "{\"any\":{\"in\":{\"lhs\":{\"splat\":\"dns.domains\"},\"rhs\":\"\$${list_id}\"}}}"
     )
+
 done
 
 if (( ${#expressions[@]} == 1 )); then
+
     expression_json="${expressions[0]}"
+
 else
+
     joined=$(IFS=','; echo "${expressions[*]}")
     expression_json="{\"or\":[${joined}]}"
+
 fi
 
 json_data=$(
@@ -645,7 +775,9 @@ git config user.name \
 git add "$DOMAIN_FILE" || error "Failed to stage domain list."
 
 if git diff --cached --quiet; then
+
     echo "No repository changes to commit."
+
 else
 
     git commit \
@@ -654,6 +786,7 @@ else
 
     git push origin HEAD:main \
         || error "Failed to push the updated domains list."
+
 fi
 
 echo ""
