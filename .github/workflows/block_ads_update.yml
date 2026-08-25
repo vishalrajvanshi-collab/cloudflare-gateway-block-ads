@@ -3,10 +3,11 @@ name: Block ads update
 on:
   schedule:
     - cron: "0 * * * *"
-  push:
-    branches:
-      - "**"
   workflow_dispatch:
+
+concurrency:
+  group: block-ads-update
+  cancel-in-progress: true
 
 jobs:
   block_ads_update:
@@ -44,8 +45,7 @@ jobs:
           echo "Cloudflare secrets are configured."
 
       - name: Make script executable
-        run: |
-          chmod +x block_ads.sh
+        run: chmod +x block_ads.sh
 
       - name: Run block ads update
         env:
@@ -55,5 +55,4 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_ACTOR_ID: ${{ github.actor_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          ./block_ads.sh
+        run: ./block_ads.sh
