@@ -30,34 +30,43 @@ jobs:
             echo "========================================"
 
             WORKFLOW_ID=$(gh api \
-              "/repos/${REPO}/actions/workflows" \
               --paginate \
-              --jq --arg NAME "$WORKFLOW_NAME" \
-              '.workflows[] | select(.name == $NAME) | .id' |
+              "/repos/${REPO}/actions/workflows" \
+              --jq ".workflows[] | select(.name == \"${WORKFLOW_NAME}\") | .id" |
               head -n 1)
 
             if [ -z "$WORKFLOW_ID" ]; then
-              echo "Workflow not found: ${WORKFLOW_NAME}"
-              return 0
+              echo "ERROR: Workflow not found: ${WORKFLOW_NAME}"
+              return 1
             fi
 
             echo "Workflow ID: ${WORKFLOW_ID}"
             echo "Keeping newest 1 run."
 
-            gh api \
+            RUN_IDS=$(gh api \
               --paginate \
               "/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
-              --jq '.workflow_runs[] | [.id, .run_number, .created_at] | @tsv' |
-            tail -n +2 |
-            while IFS=$'\t' read -r RUN_ID RUN_NUMBER CREATED_AT; do
+              --jq '.workflow_runs[].id' |
+              tail -n +2)
 
-              echo "Deleting run #${RUN_NUMBER} (${CREATED_AT})..."
+            if [ -z "$RUN_IDS" ]; then
+              echo "Nothing to delete."
+              return 0
+            fi
+
+            echo "$RUN_IDS" |
+            xargs -P 10 -n 1 sh -c '
+              RUN_ID="$1"
+
+              echo "Deleting run ${RUN_ID}..."
 
               gh api \
                 --method DELETE \
-                "/repos/${REPO}/actions/runs/${RUN_ID}" || true
+                "/repos/'"${REPO}"'/actions/runs/${RUN_ID}" \
+                >/dev/null || true
+            ' _
 
-            done
+            echo "Finished cleaning ${WORKFLOW_NAME}."
           }
 
           cleanup_workflow "Block ads update"
