@@ -1,7 +1,9 @@
-name: Cleanup old workflow runs
+name: Cleanup old block_ads runs
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 jobs:
   cleanup:
@@ -11,21 +13,39 @@ jobs:
       actions: write
 
     steps:
-      - name: Delete old workflow runs
+      - name: Delete old block_ads_update runs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Deleting old workflow runs..."
+          set -e
 
-          gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/actions/runs?per_page=100" \
-            --jq '.workflow_runs[] | [.id, .run_number, .created_at, .status] | @tsv' |
-          tail -n +101 |
-          while IFS=$'\t' read -r id number created status; do
-            echo "Deleting run #$number ($id)"
+          echo "Finding block_ads_update workflow..."
+
+          WORKFLOW_ID=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows" \
+            --paginate \
+            --jq '.workflows[] | select(.name == "block_ads_update") | .id' |
+            head -n 1)
+
+          if [ -z "$WORKFLOW_ID" ]; then
+            echo "Workflow block_ads_update not found."
+            exit 1
+          fi
+
+          echo "Workflow ID: $WORKFLOW_ID"
+          echo "Keeping the newest 5 runs."
+
+          gh api \
+            --paginate \
+            "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?per_page=100" \
+            --jq '.workflow_runs[] | [.id, .run_number, .created_at] | @tsv' |
+          tail -n +6 |
+          while IFS=$'\t' read -r RUN_ID RUN_NUMBER CREATED_AT; do
+            echo "Deleting run #${RUN_NUMBER} (${CREATED_AT})..."
+
             gh api \
               --method DELETE \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/${{ github.repository }}/actions/runs/$id" || true
+              "/repos/${{ github.repository }}/actions/runs/${RUN_ID}"
           done
+
+          echo "Cleanup complete."
