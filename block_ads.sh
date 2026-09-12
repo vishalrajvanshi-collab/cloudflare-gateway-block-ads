@@ -550,50 +550,6 @@ for ((list_number=1; list_number<=total_lists; list_number++)); do
 done
 
 # --------------------------------------------------
-# Delete excess Block ads lists
-# --------------------------------------------------
-
-echo ""
-echo "Checking for excess Block ads lists..."
-
-for i in $(seq "$((total_lists + 1))" "$MAX_LISTS"); do
-
-    formatted_counter=$(printf "%03d" "$i")
-    list_name="${PREFIX} - ${formatted_counter}"
-
-    if [[ -n "${existing_lists[$list_name]+x}" ]]; then
-
-        list_id="${existing_lists[$list_name]}"
-
-        echo ""
-        echo "Deleting excess list ${list_name} (${list_id})..."
-
-        response=$(curl -sS \
-            -w $'\nHTTP_STATUS:%{http_code}' \
-            --connect-timeout 15 \
-            --max-time 120 \
-            -X DELETE \
-            "${AUTH_HEADERS[@]}" \
-            "${LISTS_URL}/${list_id}")
-
-        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
-        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
-
-        if [[ "$http_status" != "200" ]] &&
-           [[ "$http_status" != "204" ]]; then
-
-            echo "$body" | jq . 2>/dev/null || echo "$body"
-
-            error "Failed to delete excess list ${list_name} (${list_id})."
-        fi
-
-        echo "  Deleted successfully."
-
-    fi
-
-done
-
-# --------------------------------------------------
 # Get current Gateway rules
 # --------------------------------------------------
 
@@ -752,6 +708,58 @@ else
     echo "Block ads policy updated."
 
 fi
+
+# --------------------------------------------------
+# Delete excess Block ads lists
+# --------------------------------------------------
+
+echo ""
+echo "Checking for excess Block ads lists..."
+
+for i in $(seq "$((total_lists + 1))" "$MAX_LISTS"); do
+
+    formatted_counter=$(printf "%03d" "$i")
+    list_name="${PREFIX} - ${formatted_counter}"
+
+    if [[ -n "${existing_lists[$list_name]+x}" ]]; then
+
+        list_id="${existing_lists[$list_name]}"
+
+        echo ""
+        echo "Deleting excess list ${list_name} (${list_id})..."
+
+        response=$(curl -sS \
+            -w $'\nHTTP_STATUS:%{http_code}' \
+            --connect-timeout 15 \
+            --max-time 120 \
+            -X DELETE \
+            "${AUTH_HEADERS[@]}" \
+            "${LISTS_URL}/${list_id}")
+
+        http_status=$(echo "$response" | sed -n 's/^HTTP_STATUS://p')
+        body=$(echo "$response" | sed '/^HTTP_STATUS:/d')
+
+       if [[ "$http_status" != "200" ]] &&
+   [[ "$http_status" != "204" ]]; then
+
+    echo "$body" | jq . 2>/dev/null || echo "$body"
+
+    if echo "$body" | jq -e '
+        .errors[]?.message
+        | test("List is in use at gateway policies"; "i")
+    ' >/dev/null 2>&1; then
+
+        error "Cannot delete ${list_name} (${list_id}) because it is still referenced by a Gateway policy. The policy update may not have removed the old list reference."
+    fi
+
+    error "Failed to delete excess list ${list_name} (${list_id})."
+fi
+
+        echo "  Deleted successfully."
+
+    fi
+
+done
 
 # --------------------------------------------------
 # Clean up temporary chunks
